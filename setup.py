@@ -28,12 +28,13 @@ if has_cuda:
     sources.append("mast3r_slam/backend/src/matching_kernels.cu")
     extra_compile_args["nvcc"] = [
         "-O3",
-        "-gencode=arch=compute_60,code=sm_60",
-        "-gencode=arch=compute_61,code=sm_61",
-        "-gencode=arch=compute_70,code=sm_70",
-        "-gencode=arch=compute_75,code=sm_75",
-        "-gencode=arch=compute_80,code=sm_80",
-        "-gencode=arch=compute_86,code=sm_86",
+        "-gencode=arch=compute_70,code=sm_70",   # V100
+        "-gencode=arch=compute_75,code=sm_75",   # RTX 20 series
+        "-gencode=arch=compute_80,code=sm_80",   # A100
+        "-gencode=arch=compute_86,code=sm_86",   # RTX 30 series
+        "-gencode=arch=compute_89,code=sm_89",   # RTX 40 series / Ada
+        "-gencode=arch=compute_90,code=sm_90",   # H100 / Hopper
+        "-gencode=arch=compute_120,code=sm_120", # RTX 50 series / Blackwell
     ]
     ext_modules = [
         CUDAExtension(

@@ -143,7 +143,7 @@ def run_backend(cfg, model, states, keyframes, K):
 
 
 if __name__ == "__main__":
-    mp.set_start_method("spawn")
+    mp.set_start_method("spawn", force=True)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.set_grad_enabled(False)
     device = "cuda:0"

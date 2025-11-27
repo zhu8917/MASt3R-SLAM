@@ -1,0 +1,6 @@
+# Single-thread configuration for RTX 5080 / headless systems
+# Avoids multiprocessing CUDA memory sharing issues
+
+inherit: config/calib.yaml
+single_thread: True  # Disable multiprocessing to avoid pidfd_getfd errors
+

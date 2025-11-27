@@ -6,13 +6,13 @@ build-backend = "setuptools.build_meta"
 name = "MAST3R-SLAM"
 version = "0.0.1"
 dependencies = [
-    "numpy==1.26.4",
+    "numpy>=1.26.4,<2.3.0",  # Compatible with both opencv-python and other deps
     "einops",
     "pyrealsense2",
     "evo",
     "natsort",
     # "torchcodec==0.1",
-    "lietorch @ git+https://github.com/princeton-vl/lietorch.git",
+    "lietorch",  # Already installed, no need to clone from GitHub
     "plyfile",
 ]
 
