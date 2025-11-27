@@ -6,6 +6,9 @@ from mast3r_slam.geometry import (
     get_pixel_coords,
     constrain_points_to_ray,
     project_calib,
+    sim3_point_linear,
+    propagate_covariance,
+    compute_residual_variance,
 )
 from mast3r_slam.nonlinear_optimizer import check_convergence, huber
 from mast3r_slam.config import config
@@ -73,7 +76,14 @@ class FrameTracker:
             # Track
             if not use_calib:
                 T_WCf, T_CkCf = self.opt_pose_ray_dist_sim3(
-                    Xf, Xk, T_WCf, T_WCk, Qk, valid_opt
+                    Xf,
+                    Xk,
+                    T_WCf,
+                    T_WCk,
+                    Qk,
+                    valid_opt,
+                    keyframe.Sigma,
+                    frame.Sigma,
                 )
             else:
                 T_WCf, T_CkCf = self.opt_pose_calib_sim3(
@@ -87,6 +97,8 @@ class FrameTracker:
                     valid_meas_k,
                     K,
                     img_size,
+                    keyframe.Sigma,
+                    frame.Sigma,
                 )
         except Exception as e:
             print(f"Cholesky failed {frame.frame_id}")
@@ -96,7 +108,9 @@ class FrameTracker:
 
         # Use pose to transform points to update keyframe
         Xkk = T_CkCf.act(Xkf)
-        keyframe.update_pointmap(Xkk, Ckf)
+        A_fuse = sim3_point_linear(T_CkCf)
+        Sigma_f_rot = propagate_covariance(frame.Sigma, A_fuse)
+        keyframe.update_pointmap(Xkk, Ckf, Sigma_f_rot)
         # write back the fitered pointmap
         self.keyframes[len(self.keyframes) - 1] = keyframe
 
@@ -170,17 +184,29 @@ class FrameTracker:
 
         return tau_j, cost
 
-    def opt_pose_ray_dist_sim3(self, Xf, Xk, T_WCf, T_WCk, Qk, valid):
+    def opt_pose_ray_dist_sim3(
+        self, Xf, Xk, T_WCf, T_WCk, Qk, valid, Sigma_k=None, Sigma_f=None
+    ):
         last_error = 0
-        sqrt_info_ray = 1 / self.cfg["sigma_ray"] * valid * torch.sqrt(Qk)
-        sqrt_info_dist = 1 / self.cfg["sigma_dist"] * valid * torch.sqrt(Qk)
-        sqrt_info = torch.cat((sqrt_info_ray.repeat(1, 3), sqrt_info_dist), dim=1)
+        device = Xf.device
+        dtype = Xf.dtype
+        Sigma_k = Sigma_k.to(device=device, dtype=dtype)
+        Sigma_f = Sigma_f.to(device=device, dtype=dtype)
+        cfg_eps = self.cfg.get("cov_eps", 1e-6)
+        var_floor = self.cfg.get("var_floor", 1e-4)
+        weight_clamp = self.cfg.get("weight_clamp", False)
+        clamp_min = self.cfg.get("weight_clamp_min", 1e-3)
+        clamp_max = self.cfg.get("weight_clamp_max", 1e3)
+        min_valid = self.cfg.get("min_valid_residuals", 10)
+
+        sqrt_Q = torch.sqrt(torch.clamp(Qk, min=1e-9))
+        valid_mask = valid.squeeze(-1) if valid.dim() == 2 else valid
+
+        # Pre-calc residual on keyframe side
+        rd_k, Jk = point_to_ray_dist(Xk, jacobian=True)
 
         # Solving for relative pose without scale!
         T_CkCf = T_WCk.inv() * T_WCf
-
-        # Precalculate distance and ray for obs k
-        rd_k = point_to_ray_dist(Xk, jacobian=False)
 
         old_cost = float("inf")
         for step in range(self.cfg["max_iters"]):
@@ -191,7 +217,52 @@ class FrameTracker:
             # Jacobian
             J = -drd_f_Ck_dXf_Ck @ dXf_Ck_dT_CkCf
 
-            tau_ij_sim3, new_cost = self.solve(sqrt_info, r, J)
+            # 协方差传播与自适应权重计算
+            A = sim3_point_linear(T_CkCf)
+            Sigma_f_rot = propagate_covariance(Sigma_f, A)
+            var_k = compute_residual_variance(Jk, Sigma_k)
+            var_f = compute_residual_variance(drd_f_Ck_dXf_Ck, Sigma_f_rot)
+            var_total = var_k + var_f + cfg_eps
+            var_total = torch.clamp(var_total, min=var_floor)
+
+            valid_depth = (Xk[:, 2] > 0) & (Xf_Ck[:, 2] > 0)
+            valid_total = valid_mask & valid_depth
+            valid_total = valid_total.unsqueeze(-1).to(Xf.dtype)
+            valid_count = (valid_total.squeeze(-1) > 0).sum().item()
+
+            if valid_count < min_valid:
+                sqrt_info_ray = (
+                    (1 / self.cfg["sigma_ray"]) * sqrt_Q * valid_total
+                ).repeat(1, 3)
+                sqrt_info_dist = (1 / self.cfg["sigma_dist"]) * sqrt_Q * valid_total
+            else:
+                sqrt_info_ray = (
+                    (1 / self.cfg["sigma_ray"])
+                    * sqrt_Q
+                    * valid_total
+                    / torch.sqrt(var_total[:, :3])
+                )
+                sqrt_info_dist = (
+                    (1 / self.cfg["sigma_dist"])
+                    * sqrt_Q
+                    * valid_total
+                    / torch.sqrt(var_total[:, 3:4])
+                )
+            if weight_clamp:
+                sqrt_info_ray = torch.clamp(sqrt_info_ray, clamp_min, clamp_max)
+                sqrt_info_dist = torch.clamp(sqrt_info_dist, clamp_min, clamp_max)
+            sqrt_info = torch.cat((sqrt_info_ray, sqrt_info_dist), dim=-1)
+
+            try:
+                tau_ij_sim3, new_cost = self.solve(sqrt_info, r, J)
+            except RuntimeError as err:
+                print(f"[opt_pose_ray_dist_sim3] GN solve failed, falling back to constant weights: {err}")
+                const_ray = (
+                    (1 / self.cfg["sigma_ray"]) * sqrt_Q * valid_total
+                ).repeat(1, 3)
+                const_dist = (1 / self.cfg["sigma_dist"]) * sqrt_Q * valid_total
+                const_sqrt = torch.cat((const_ray, const_dist), dim=-1)
+                tau_ij_sim3, new_cost = self.solve(const_sqrt, r, J)
             T_CkCf = T_CkCf.retr(tau_ij_sim3)
 
             if check_convergence(
@@ -214,12 +285,43 @@ class FrameTracker:
         return T_WCf, T_CkCf
 
     def opt_pose_calib_sim3(
-        self, Xf, Xk, T_WCf, T_WCk, Qk, valid, meas_k, valid_meas_k, K, img_size
+        self,
+        Xf,
+        Xk,
+        T_WCf,
+        T_WCk,
+        Qk,
+        valid,
+        meas_k,
+        valid_meas_k,
+        K,
+        img_size,
+        Sigma_k,
+        Sigma_f,
     ):
         last_error = 0
-        sqrt_info_pixel = 1 / self.cfg["sigma_pixel"] * valid * torch.sqrt(Qk)
-        sqrt_info_depth = 1 / self.cfg["sigma_depth"] * valid * torch.sqrt(Qk)
-        sqrt_info = torch.cat((sqrt_info_pixel.repeat(1, 2), sqrt_info_depth), dim=1)
+        device = Xf.device
+        dtype = Xf.dtype
+        Sigma_k = Sigma_k.to(device=device, dtype=dtype)
+        Sigma_f = Sigma_f.to(device=device, dtype=dtype)
+        cfg_eps = self.cfg.get("cov_eps", 1e-6)
+        var_floor = self.cfg.get("var_floor", 1e-4)
+        weight_clamp = self.cfg.get("weight_clamp", False)
+        clamp_min = self.cfg.get("weight_clamp_min", 1e-2)
+        clamp_max = self.cfg.get("weight_clamp_max", 1e2)
+        min_valid = self.cfg.get("min_valid_residuals", 10)
+
+        sqrt_Q = torch.sqrt(torch.clamp(Qk, min=1e-9))
+        valid_mask = valid.squeeze(-1) if valid.dim() == 2 else valid
+
+        pz_k, dpz_k_dXk, valid_proj_k = project_calib(
+            Xk,
+            K,
+            img_size,
+            jacobian=True,
+            border=self.cfg["pixel_border"],
+            z_eps=self.cfg["depth_eps"],
+        )
 
         # Solving for relative pose without scale!
         T_CkCf = T_WCk.inv() * T_WCf
@@ -235,15 +337,55 @@ class FrameTracker:
                 border=self.cfg["pixel_border"],
                 z_eps=self.cfg["depth_eps"],
             )
-            valid2 = valid_proj & valid_meas_k
-            sqrt_info2 = valid2 * sqrt_info
+            valid2 = (valid_proj & valid_meas_k & valid_proj_k & valid_mask).to(Xf.dtype)
+            residual_mask = valid2.unsqueeze(-1)
 
             # r = z-h(x)
-            r = meas_k - pzf_Ck
+            r = (meas_k - pzf_Ck) * residual_mask
             # Jacobian
-            J = -dpzf_Ck_dXf_Ck @ dXf_Ck_dT_CkCf
+            J = (-dpzf_Ck_dXf_Ck @ dXf_Ck_dT_CkCf) * residual_mask.unsqueeze(-1)
 
-            tau_ij_sim3, new_cost = self.solve(sqrt_info2, r, J)
+            A = sim3_point_linear(T_CkCf)
+            Sigma_f_rot = propagate_covariance(Sigma_f, A)
+            var_k = compute_residual_variance(dpz_k_dXk, Sigma_k)
+            var_f = compute_residual_variance(dpzf_Ck_dXf_Ck, Sigma_f_rot)
+            var_total = var_k + var_f + cfg_eps
+            var_total = torch.clamp(var_total, min=var_floor)
+
+            valid_count = (residual_mask.squeeze(-1) > 0).sum().item()
+            if valid_count < min_valid:
+                sqrt_info_pix = (
+                    (1 / self.cfg["sigma_pixel"]) * sqrt_Q * residual_mask
+                ).repeat(1, 2)
+                sqrt_info_depth = (1 / self.cfg["sigma_depth"]) * sqrt_Q * residual_mask
+            else:
+                sqrt_info_pix = (
+                    (1 / self.cfg["sigma_pixel"])
+                    * sqrt_Q
+                    * residual_mask
+                    / torch.sqrt(var_total[:, :2])
+                )
+                sqrt_info_depth = (
+                    (1 / self.cfg["sigma_depth"])
+                    * sqrt_Q
+                    * residual_mask
+                    / torch.sqrt(var_total[:, 2:3])
+                )
+            if weight_clamp:
+                sqrt_info_pix = torch.clamp(sqrt_info_pix, clamp_min, clamp_max)
+                sqrt_info_depth = torch.clamp(sqrt_info_depth, clamp_min, clamp_max)
+            sqrt_info = torch.cat((sqrt_info_pix, sqrt_info_depth), dim=-1)
+
+            try:
+                tau_ij_sim3, new_cost = self.solve(sqrt_info, r, J)
+            except RuntimeError as err:
+                print(f"[opt_pose_calib_sim3] GN solve failed, falling back to constant weights: {err}")
+                const_pix = (
+                    (1 / self.cfg["sigma_pixel"]) * sqrt_Q * residual_mask
+                ).repeat(1, 2)
+                const_depth = (1 / self.cfg["sigma_depth"]) * sqrt_Q * residual_mask
+                const_sqrt = torch.cat((const_pix, const_depth), dim=-1)
+                tau_ij_sim3, new_cost = self.solve(const_sqrt, r, J)
             T_CkCf = T_CkCf.retr(tau_ij_sim3)
 
             if check_convergence(

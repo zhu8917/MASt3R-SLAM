@@ -149,6 +149,7 @@ if __name__ == "__main__":
     device = "cuda:0"
     save_frames = False
     datetime_now = str(datetime.datetime.now()).replace(" ", "_")
+    run_suffix = datetime.datetime.now().strftime("%m%d_%H%M_%S")
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", default="datasets/tum/rgbd_dataset_freiburg1_desk")
@@ -210,8 +211,11 @@ if __name__ == "__main__":
         keyframes.set_intrinsics(K)
 
     # remove the trajectory from the previous run
+    save_dir = None
+    seq_name = None
     if dataset.save_results:
-        save_dir, seq_name = eval.prepare_savedir(args, dataset)
+        save_dir, base_seq_name = eval.prepare_savedir(args, dataset)
+        seq_name = f"{base_seq_name}_{run_suffix}"
         traj_file = save_dir / f"{seq_name}.txt"
         recon_file = save_dir / f"{seq_name}.ply"
         if traj_file.exists():
@@ -310,7 +314,6 @@ if __name__ == "__main__":
         i += 1
 
     if dataset.save_results:
-        save_dir, seq_name = eval.prepare_savedir(args, dataset)
         eval.save_traj(save_dir, f"{seq_name}.txt", dataset.timestamps, keyframes)
         eval.save_reconstruction(
             save_dir,

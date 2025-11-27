@@ -29,6 +29,7 @@ class Frame:
     N: int = 0
     N_updates: int = 0
     K: Optional[torch.Tensor] = None
+    Sigma: Optional[torch.Tensor] = None
 
     def get_score(self, C):
         filtering_score = config["tracking"]["filtering_score"]
@@ -38,8 +39,9 @@ class Frame:
             score = torch.mean(C)
         return score
 
-    def update_pointmap(self, X: torch.Tensor, C: torch.Tensor):
+    def update_pointmap(self, X: torch.Tensor, C: torch.Tensor, Sigma_new: Optional[torch.Tensor] = None):
         filtering_mode = config["tracking"]["filtering_mode"]
+        tracking_cfg = config["tracking"]
 
         if self.N == 0:
             self.X_canon = X.clone()
@@ -72,8 +74,57 @@ class Frame:
             self.C[new_mask] = C[new_mask]
             self.N = 1
         elif filtering_mode == "weighted_pointmap":
-            self.X_canon = ((self.C * self.X_canon) + (C * X)) / (self.C + C)
-            self.C = self.C + C
+            if Sigma_new is None or self.Sigma is None:
+                self.X_canon = ((self.C * self.X_canon) + (C * X)) / (self.C + C)
+                self.C = self.C + C
+            else:
+                lambda_reg = tracking_cfg.get("covariance_regularization", 1e-6)
+                use_conf_weight = tracking_cfg.get("use_confidence_weighting", False)
+                enable_cov_check = tracking_cfg.get("enable_covariance_check", True)
+                eye = torch.eye(3, device=self.Sigma.device, dtype=self.Sigma.dtype)
+                Sigma_k_reg = self.Sigma + lambda_reg * eye
+                Sigma_f_reg = Sigma_new.to(self.Sigma.device, self.Sigma.dtype) + lambda_reg * eye
+                try:
+                    L_k = torch.linalg.cholesky(Sigma_k_reg)
+                    L_f = torch.linalg.cholesky(Sigma_f_reg)
+                    Info_k = torch.cholesky_inverse(L_k)
+                    Info_f = torch.cholesky_inverse(L_f)
+                except RuntimeError as e:
+                    print(f"[update_pointmap] Cholesky failed, fallback to inverse: {e}")
+                    Info_k = torch.linalg.inv(Sigma_k_reg)
+                    Info_f = torch.linalg.inv(Sigma_f_reg)
+
+                if use_conf_weight:
+                    C_k = torch.mean(self.C) if self.C is not None else torch.tensor(1.0, device=Info_k.device)
+                    C_f = torch.mean(C)
+                    Info_k = C_k * Info_k
+                    Info_f = C_f * Info_f
+
+                Info_new = Info_k + Info_f
+                Sigma_fused = torch.linalg.inv(Info_new)
+                Sigma_fused = 0.5 * (Sigma_fused + Sigma_fused.T)
+
+                weighted_X_k = (Info_k @ self.X_canon.T).T
+                weighted_X_f = (Info_f @ X.T).T
+                X_fused = (Sigma_fused @ (weighted_X_k + weighted_X_f).T).T
+
+                self.X_canon = X_fused
+                self.Sigma = Sigma_fused
+                self.C = self.C + C
+
+                if enable_cov_check:
+                    eigvals = torch.linalg.eigvalsh(self.Sigma)
+                    min_eig = eigvals.min().item()
+                    max_eig = eigvals.max().item()
+                    cond = max_eig / (min_eig + 1e-12)
+                    if min_eig < 1e-8:
+                        self.Sigma = self.Sigma + 1e-6 * eye
+                    if cond > 1e6:
+                        Sigma_init = torch.diag(
+                            torch.tensor(tracking_cfg["sigma_frame_diag"], device=self.Sigma.device, dtype=self.Sigma.dtype)
+                        ) ** 2
+                        self.Sigma = 0.9 * self.Sigma + 0.1 * Sigma_init
+
             self.N += 1
         elif filtering_mode == "weighted_spherical":
 
@@ -119,6 +170,12 @@ def create_frame(i, img, T_WC, img_size=512, device="cuda:0"):
         uimg = uimg[::downsample, ::downsample]
         img_shape = img_shape // downsample
     frame = Frame(i, rgb, img_shape, img_true_shape, uimg, T_WC)
+
+    sigma_frame_diag = config["tracking"].get("sigma_frame_diag", [0.02, 0.02, 0.08])
+    sigma_tensor = torch.tensor(
+        sigma_frame_diag, dtype=rgb.dtype, device=rgb.device
+    )
+    frame.Sigma = torch.diag(sigma_tensor**2)
     return frame
 
 
@@ -239,6 +296,7 @@ class SharedKeyframes:
         self.T_WC = torch.zeros(buffer, 1, lietorch.Sim3.embedded_dim, device=device, dtype=dtype).share_memory_()
         self.X = torch.zeros(buffer, h * w, 3, device=device, dtype=dtype).share_memory_()
         self.C = torch.zeros(buffer, h * w, 1, device=device, dtype=dtype).share_memory_()
+        self.Sigma = torch.zeros(buffer, 3, 3, device=device, dtype=dtype).share_memory_()
         self.N = torch.zeros(buffer, device=device, dtype=torch.int).share_memory_()
         self.N_updates = torch.zeros(buffer, device=device, dtype=torch.int).share_memory_()
         self.feat = torch.zeros(buffer, 1, self.num_patches, self.feat_dim, device=device, dtype=dtype).share_memory_()
@@ -266,6 +324,7 @@ class SharedKeyframes:
             kf.N_updates = int(self.N_updates[idx])
             if config["use_calib"]:
                 kf.K = self.K
+            kf.Sigma = self.Sigma[idx]
             return kf
 
     def __setitem__(self, idx, value: Frame) -> None:
@@ -281,6 +340,8 @@ class SharedKeyframes:
             self.T_WC[idx] = value.T_WC.data
             self.X[idx] = value.X_canon
             self.C[idx] = value.C
+            if value.Sigma is not None:
+                self.Sigma[idx] = value.Sigma
             self.feat[idx] = value.feat
             self.pos[idx] = value.pos
             self.N[idx] = value.N

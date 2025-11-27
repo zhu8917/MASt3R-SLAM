@@ -52,6 +52,47 @@ def act_Sim3(X: lietorch.Sim3, pC: torch.Tensor, jacobian=False):
     return pW, torch.cat([dpC_dt, dpC_dR, dpc_ds], dim=-1)  # view(-1, mdim)
 
 
+def sim3_point_linear(T: lietorch.Sim3) -> torch.Tensor:
+    """
+    数值方式提取 Sim3 变换的线性部分 A = sR。
+
+    Args:
+        T: lietorch.Sim3 对象
+    Returns:
+        torch.Tensor: 形状 (3, 3) 的线性部分
+    """
+    device = T.data.device
+    dtype = T.data.dtype
+
+    origin = torch.zeros(1, 3, device=device, dtype=dtype)
+    basis = torch.eye(3, device=device, dtype=dtype)
+
+    origin_act = T.act(origin)
+    cols = []
+    for i in range(3):
+        e = basis[i].view(1, 3)
+        cols.append((T.act(e) - origin_act).squeeze(0))
+    return torch.stack(cols, dim=-1)
+
+
+def propagate_covariance(Sigma: torch.Tensor, A: torch.Tensor) -> torch.Tensor:
+    """
+    批量协方差传播 Σ' = A Σ Aᵀ。
+    支持 (3,3) 或批量 (B,3,3) 输入。
+    """
+    if Sigma.ndim == 2:
+        return A @ Sigma @ A.transpose(-1, -2)
+    return torch.bmm(torch.bmm(A, Sigma), A.transpose(-1, -2))
+
+
+def compute_residual_variance(J: torch.Tensor, Sigma: torch.Tensor) -> torch.Tensor:
+    """
+    计算 Var(r) = diag(J Σ Jᵀ)，支持 N×d×3 雅可比。
+    返回形状 (N, d) 的方差。
+    """
+    return torch.einsum("nij,jk,nik->ni", J, Sigma, J)
+
+
 def decompose_K(K):
     fx = K[..., 0, 0]
     fy = K[..., 1, 1]

@@ -31,6 +31,16 @@ tracking:
   depth_eps: 1e-6 # Only in calib case
   filtering_mode: weighted_pointmap # recent, first, best_score, weighted_pointmap, weighted_spherical, indep_conf
   filtering_score: median # median, mean (only used for filtering_mode=best_score)
+  sigma_frame_diag: [0.02, 0.02, 0.08] # uncertainty of sigma_x, sigma_y, sigma_z
+  cov_eps: 1.0e-6 # epsilon added to residual variance for numerical stability
+  var_floor: 1.0e-4 # minimum residual variance to avoid infinite weights
+  min_valid_residuals: 10 # fallback to constant weights if valid residuals below this
+  weight_clamp: true # enable to clamp sqrt-info weights (improves robustness)
+  weight_clamp_min: 1.0e-2 # lower bound for sqrt-info when clamping is enabled
+  weight_clamp_max: 1.0e1 # upper bound for sqrt-info when clamping is enabled
+  covariance_regularization: 1.0e-6 # diagonal jitter added before inverting covariances
+  use_confidence_weighting: false # scale information matrices using average confidence
+  enable_covariance_check: true # run eigenvalue/condition monitoring after each fusion
 
 local_opt:
   pin: 1
